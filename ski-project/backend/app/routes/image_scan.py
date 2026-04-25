@@ -1,0 +1,155 @@
+import base64
+import json
+import httpx
+from fastapi import APIRouter, UploadFile, File, HTTPException
+from app.services.health_score import calculate_health_score
+from app.models.product import Product, NutritionFacts
+import os
+
+router = APIRouter()
+
+ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+
+EXTRACTION_PROMPT = """You are a food label analyst. Carefully examine this food product label image.
+
+Extract ALL visible information and respond with ONLY a valid JSON object — no markdown, no explanation.
+
+JSON structure (use null for any field not visible):
+{
+  "name": "product name",
+  "brand": "brand name",
+  "ingredients": "full ingredients text as shown",
+  "nutrition": {
+    "energy_kcal": number or null,
+    "fat": number or null,
+    "saturated_fat": number or null,
+    "sugars": number or null,
+    "sodium": number or null,
+    "fiber": number or null,
+    "proteins": number or null
+  },
+  "nutriscore": "a/b/c/d/e or null",
+  "nova_group": 1-4 or null,
+  "additives_detected": ["list", "of", "any", "visible", "additives"],
+  "allergens": ["list", "of", "allergens"],
+  "extraction_confidence": "high/medium/low",
+  "notes": "anything else relevant or unclear on the label"
+}
+
+Rules:
+- Nutrition values must be per 100g or per 100ml (convert if shown per serving)
+- Sodium: return in g/100g (so 500mg = 0.5)
+- If only serving size values shown, estimate per-100g by dividing accordingly
+- Extract ALL ingredients even if the text is small"""
+
+
+async def call_claude_vision(image_b64: str, media_type: str) -> dict:
+    """Send image to Claude and extract structured food label data."""
+    if not ANTHROPIC_API_KEY:
+        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set in environment")
+
+    payload = {
+        "model": "claude-opus-4-6",
+        "max_tokens": 1024,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": media_type,
+                            "data": image_b64,
+                        },
+                    },
+                    {"type": "text", "text": EXTRACTION_PROMPT},
+                ],
+            }
+        ],
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        res = await client.post(
+            ANTHROPIC_API_URL,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json=payload,
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Claude API error: {res.text}")
+
+    response_text = res.json()["content"][0]["text"].strip()
+
+    # Strip any accidental markdown fences
+    if response_text.startswith("```"):
+        response_text = response_text.split("```")[1]
+        if response_text.startswith("json"):
+            response_text = response_text[4:]
+
+    try:
+        return json.loads(response_text)
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Could not parse Claude response: {e}")
+
+
+@router.post("/")
+async def scan_image(file: UploadFile = File(...)):
+    """
+    Upload a food label image.
+    Claude Vision extracts ingredients + nutrition, then we score it.
+    """
+    # Validate file type
+    allowed = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+    if file.content_type not in allowed:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type: {file.content_type}. Use JPEG, PNG, or WebP."
+        )
+
+    # Read and encode image
+    image_bytes = await file.read()
+    if len(image_bytes) > 10 * 1024 * 1024:  # 10MB limit
+        raise HTTPException(status_code=400, detail="Image too large. Max 10MB.")
+
+    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
+
+    # Extract data via Claude Vision
+    extracted = await call_claude_vision(image_b64, file.content_type)
+
+    # Build Product model from extracted data
+    nutrition_data = extracted.get("nutrition") or {}
+    product = Product(
+        barcode=f"image_{file.filename}",
+        name=extracted.get("name") or "Unknown Product",
+        brand=extracted.get("brand"),
+        ingredients=extracted.get("ingredients"),
+        nutriscore=extracted.get("nutriscore"),
+        nova_group=extracted.get("nova_group"),
+        nutrition=NutritionFacts(
+            energy_kcal=nutrition_data.get("energy_kcal"),
+            fat=nutrition_data.get("fat"),
+            saturated_fat=nutrition_data.get("saturated_fat"),
+            sugars=nutrition_data.get("sugars"),
+            sodium=nutrition_data.get("sodium"),
+            fiber=nutrition_data.get("fiber"),
+            proteins=nutrition_data.get("proteins"),
+        ),
+    )
+
+    health = calculate_health_score(product)
+
+    return {
+        "source": "image_scan",
+        "filename": file.filename,
+        "extraction_confidence": extracted.get("extraction_confidence", "medium"),
+        "product": product.model_dump(),
+        "health_score": health.model_dump(),
+        "additives_detected": extracted.get("additives_detected", []),
+        "allergens": extracted.get("allergens", []),
+        "notes": extracted.get("notes"),
+    }
