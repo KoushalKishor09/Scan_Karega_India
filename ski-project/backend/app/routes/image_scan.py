@@ -1,15 +1,19 @@
 import base64
 import json
+
 import httpx
 from fastapi import APIRouter, UploadFile, File, HTTPException
-from app.services.health_score import calculate_health_score
+
+from app.core.config import settings
 from app.models.product import Product, NutritionFacts
-import os
+from app.services.health_score import calculate_health_score
 
 router = APIRouter()
 
-ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_API_URL = (
+    f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+)
 
 EXTRACTION_PROMPT = """You are a food label analyst. Carefully examine this food product label image.
 
@@ -44,64 +48,79 @@ Rules:
 - Extract ALL ingredients even if the text is small"""
 
 
-async def call_claude_vision(image_b64: str, media_type: str) -> dict:
-    """Send image to Claude and extract structured food label data."""
-    if not ANTHROPIC_API_KEY:
-        raise HTTPException(status_code=500, detail="ANTHROPIC_API_KEY not set in environment")
+def _extract_text_from_gemini(payload: dict) -> str:
+    candidates = payload.get("candidates") or []
+    if not candidates:
+        raise HTTPException(status_code=502, detail="Gemini returned no candidates")
 
-    payload = {
-        "model": "claude-opus-4-6",
-        "max_tokens": 1024,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": media_type,
-                            "data": image_b64,
-                        },
-                    },
-                    {"type": "text", "text": EXTRACTION_PROMPT},
-                ],
-            }
-        ],
-    }
+    parts = candidates[0].get("content", {}).get("parts", [])
+    text_chunks = [part.get("text", "") for part in parts if part.get("text")]
+    if not text_chunks:
+        raise HTTPException(status_code=502, detail="Gemini returned no text content")
 
-    async with httpx.AsyncClient(timeout=30) as client:
-        res = await client.post(
-            ANTHROPIC_API_URL,
-            headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-            json=payload,
-        )
-        if res.status_code != 200:
-            raise HTTPException(status_code=502, detail=f"Claude API error: {res.text}")
+    response_text = "".join(text_chunks).strip()
 
-    response_text = res.json()["content"][0]["text"].strip()
-
-    # Strip any accidental markdown fences
     if response_text.startswith("```"):
         response_text = response_text.split("```")[1]
         if response_text.startswith("json"):
             response_text = response_text[4:]
 
+    return response_text.strip()
+
+
+async def call_gemini_vision(image_b64: str, media_type: str) -> dict:
+    """Send image to Gemini and extract structured food label data."""
+    api_key = settings.GEMINI_API_KEY
+    if not api_key:
+        raise HTTPException(
+            status_code=500,
+            detail="GEMINI_API_KEY not set in environment",
+        )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": EXTRACTION_PROMPT},
+                    {
+                        "inline_data": {
+                            "mime_type": media_type,
+                            "data": image_b64,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0,
+        },
+    }
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        res = await client.post(
+            GEMINI_API_URL,
+            headers={
+                "x-goog-api-key": api_key,
+                "content-type": "application/json",
+            },
+            json=payload,
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=502, detail=f"Gemini API error: {res.text}")
+
+    response_text = _extract_text_from_gemini(res.json())
+
     try:
         return json.loads(response_text)
     except json.JSONDecodeError as e:
-        raise HTTPException(status_code=502, detail=f"Could not parse Claude response: {e}")
+        raise HTTPException(status_code=502, detail=f"Could not parse Gemini response: {e}")
 
 
 @router.post("/")
 async def scan_image(file: UploadFile = File(...)):
     """
     Upload a food label image.
-    Claude Vision extracts ingredients + nutrition, then we score it.
+    Gemini Vision extracts ingredients + nutrition, then we score it.
     """
     # Validate file type
     allowed = {"image/jpeg", "image/png", "image/webp", "image/gif"}
@@ -118,8 +137,8 @@ async def scan_image(file: UploadFile = File(...)):
 
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
-    # Extract data via Claude Vision
-    extracted = await call_claude_vision(image_b64, file.content_type)
+    # Extract data via Gemini Vision
+    extracted = await call_gemini_vision(image_b64, file.content_type)
 
     # Build Product model from extracted data
     nutrition_data = extracted.get("nutrition") or {}
