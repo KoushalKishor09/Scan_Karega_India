@@ -1,0 +1,1 @@
+"""SKI backend application package."""

@@ -1,7 +1,7 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.routes import scan, products, health_score, image_scan
 from app.core.config import settings
+from app.routes import scan, products, health_score, image_scan
 
 app = FastAPI(
     title="SKI — Scan Karega India API",
